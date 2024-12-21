@@ -1,7 +1,7 @@
 {
-  "name": "ollama-chat",
+  "name": "ollama-mcp-db",
   "version": "1.0.0",
-  "description": "A Node.js and TypeScript project using ollama-js",
+  "description": "An interactive chat interface that combines Ollama's LLM capabilities with PostgreSQL database access through the Model Context Protocol (MCP).",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
@@ -9,7 +9,14 @@
     "build": "tsc",
     "serve": "node dist/index.js"
   },
-  "keywords": [],
+  "keywords": [
+    "ollama",
+    "mcp",
+    "ai",
+    "llm",
+    "postgres",
+    "sql"
+  ],
   "author": "",
   "license": "MIT",
   "devDependencies": {

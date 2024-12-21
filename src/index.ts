@@ -7,9 +7,21 @@ import {
   CallToolResultSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import dotenv from "dotenv";
+import { fileURLToPath } from "url";
 
 // Load environment variables from .env file
 dotenv.config();
+
+// Check for required environment variables
+const databaseUrl = process.env.DATABASE_URL;
+if (!databaseUrl) {
+  console.error("Error: DATABASE_URL not found in environment or .env file");
+  console.error("Please create a .env file with the following format:");
+  console.error(
+    "DATABASE_URL=postgresql://user:password@localhost:5432/dbname"
+  );
+  process.exit(1);
+}
 
 // Type definition for database schema information
 interface DatabaseSchema {
@@ -44,11 +56,7 @@ class OllamaMCPHost {
     // The server is started using npx for convenience
     this.transport = new StdioClientTransport({
       command: "npx",
-      args: [
-        "-y",
-        "@modelcontextprotocol/server-postgres",
-        process.env.DATABASE_URL || "",
-      ],
+      args: ["-y", "@modelcontextprotocol/server-postgres", databaseUrl!],
     });
 
     // Create the MCP client with basic configuration
@@ -223,50 +231,56 @@ class OllamaMCPHost {
   }
 }
 
-/**
- * Example usage of the OllamaMCPHost
- */
+// Interactive chat interface
 async function main() {
-  // Ensure database connection information is provided
-  // Check for required environment variables
-  const databaseUrl = process.env.DATABASE_URL;
-  if (!databaseUrl) {
-    console.error("Error: DATABASE_URL not found in environment or .env file");
-    console.error("Please create a .env file with the following format:");
-    console.error(
-      "DATABASE_URL=postgres://user:password@localhost:5432/dbname"
-    );
-    process.exit(1);
-  }
-
-  // Create and initialize the host
   const host = new OllamaMCPHost();
+  const readline = (await import("readline")).default.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
 
   try {
     await host.connect();
+    console.log(
+      "\nConnected to database. You can now ask questions about your data."
+    );
+    console.log('Type "exit" to quit.\n');
 
-    // Example questions that demonstrate typical usage
-    const questions = [
-      "Which customers have purchased the most songs in the past year?",
-      "What are the top 5 most popular genres by sales?",
-    ];
+    // Promisify readline.question
+    const askQuestion = (prompt: string) =>
+      new Promise<string>((resolve) => {
+        readline.question(prompt, resolve);
+      });
 
-    // Process each question
-    for (const question of questions) {
-      console.log("\nQuestion:", question);
+    while (true) {
+      const userInput = await askQuestion(
+        "\nWhat would you like to know about your data? "
+      );
+
+      if (userInput.toLowerCase() === "exit") {
+        console.log("\nGoodbye!\n");
+        readline.close();
+        await host.cleanup();
+        process.exit(0);
+      }
+
       console.log("\nAnalyzing...\n");
-      const answer = await host.processQuestion(question);
-      console.log("Answer:", answer);
+      const answer = await host.processQuestion(userInput);
+      console.log("\n", answer, "\n");
     }
   } catch (error) {
-    console.error("Error:", error);
+    console.error(
+      "Error:",
+      error instanceof Error ? error.message : String(error)
+    );
   } finally {
+    readline.close();
     await host.cleanup();
   }
 }
 
-// Only run if called directly (not imported as a module)
-if (process.argv[1] === process.argv[1]) {
+// Only run if called directly
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
   main().catch(console.error);
 }
 
