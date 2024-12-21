@@ -69,7 +69,7 @@ Analyzing...
 
 ## How It Works
 
-1. The application connects to your PostgreSQL database through MCP
+1. The application connects to your PostgreSQL database through the [PostgreSQL MCP server](https://www.npmjs.com/package/@modelcontextprotocol/server-postgres)
 2. It loads and caches your database schema
 3. When you ask a question:
    - The schema and question are sent to Ollama
