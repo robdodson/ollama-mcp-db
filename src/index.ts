@@ -49,6 +49,9 @@ async function chat() {
         fullResponse += part.message.content;
       }
 
+      // Add a newline after the response
+      process.stdout.write("\n");
+
       // Add AI response to message history
       messages.push({ role: "assistant", content: fullResponse });
     }
@@ -62,4 +65,10 @@ async function chat() {
 console.log(
   "Welcome to the Interactive Chat! Type 'exit' to end the conversation."
 );
-chat();
+// chat();
+
+async function main() {
+  const { connect } = await import("./client.js");
+  connect();
+}
+main();
