@@ -1,5 +1,6 @@
 import ollama from "ollama";
 import readline from "readline";
+import { connect } from "./client.js";
 
 const rl = readline.createInterface({
   input: process.stdin,
@@ -66,9 +67,4 @@ console.log(
   "Welcome to the Interactive Chat! Type 'exit' to end the conversation."
 );
 // chat();
-
-async function main() {
-  const { connect } = await import("./client.js");
-  connect();
-}
-main();
+connect();

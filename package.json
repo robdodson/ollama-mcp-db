@@ -2,9 +2,10 @@
   "name": "ollama-chat",
   "version": "1.0.0",
   "description": "A Node.js and TypeScript project using ollama-js",
+  "type": "module",
   "main": "dist/index.js",
   "scripts": {
-    "start": "ts-node src/index.ts",
+    "start": "tsx src/index.ts",
     "build": "tsc",
     "serve": "node dist/index.js"
   },
@@ -13,8 +14,9 @@
   "license": "MIT",
   "devDependencies": {
     "@types/node": "^20.0.0",
-    "ts-node": "^10.0.0",
-    "typescript": "^5.0.0"
+    "ts-node": "^10.9.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.4",
