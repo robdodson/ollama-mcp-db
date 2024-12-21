@@ -20,6 +20,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.4",
+    "dotenv": "^16.4.7",
     "ollama": "^0.5.11"
   }
 }
