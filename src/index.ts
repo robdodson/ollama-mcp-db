@@ -26,46 +26,145 @@ interface DatabaseSchema {
   data_type: string;
 }
 
+interface ColumnMetadata {
+  description: string;
+  examples: string[];
+  foreignKey?: {
+    table: string;
+    column: string;
+  };
+}
+
 class OllamaMCPHost {
   private client: Client;
   private transport: StdioClientTransport;
   private modelName: string;
   private schemaCache: Map<string, DatabaseSchema[]> = new Map();
+  private columnMetadata: Map<string, Map<string, ColumnMetadata>> = new Map();
   private chatHistory: { role: string; content: string }[] = [];
   private readonly MAX_HISTORY_LENGTH = 20;
-  private readonly MAX_RETRIES = 2; // Maximum number of retry attempts
+  private readonly MAX_RETRIES = 5;
+
+  private static readonly QUERY_GUIDELINES = `
+When analyzing questions:
+1. First write a SQL query to get the necessary information. Identify which tables contain the relevant information by looking at:
+   - Table names and their purposes
+   - Column names and descriptions
+   - Foreign key relationships
+2. Use the 'query' tool to execute the SQL query
+3. If unsure about table contents, write a sample query first:
+   SELECT column_name, COUNT(*) FROM table_name GROUP BY column_name LIMIT 5;
+4. For complex questions, break down into multiple queries:
+   - First query to validate data availability
+   - Second query to get detailed information
+5. Always include appropriate JOIN conditions when combining tables
+6. Use WHERE clauses to filter irrelevant data
+7. Consider using ORDER BY for sorted results
+
+Important: Only use SELECT statements - no modifications allowed!
+
+When you are finished, analyze the results and provide a natural language response.`;
 
   constructor(modelName?: string) {
     this.modelName =
       modelName || process.env.OLLAMA_MODEL || "qwen2.5-coder:7b-instruct";
-
     this.transport = new StdioClientTransport({
       command: "npx",
       args: ["-y", "@modelcontextprotocol/server-postgres", databaseUrl!],
     });
-
     this.client = new Client(
-      {
-        name: "ollama-mcp-host",
-        version: "1.0.0",
-      },
-      {
-        capabilities: {},
-      }
+      { name: "ollama-mcp-host", version: "1.0.0" },
+      { capabilities: {} }
     );
   }
 
-  private addToHistory(role: string, content: string) {
-    this.chatHistory.push({ role, content });
+  private async detectTableRelationships(): Promise<void> {
+    // Query the database to find foreign key relationships
+    const sql = `
+      SELECT
+        tc.table_name as table_name,
+        kcu.column_name as column_name,
+        ccu.table_name AS foreign_table_name,
+        ccu.column_name AS foreign_column_name
+      FROM information_schema.table_constraints tc
+      JOIN information_schema.key_column_usage kcu
+        ON tc.constraint_name = kcu.constraint_name
+      JOIN information_schema.constraint_column_usage ccu
+        ON ccu.constraint_name = tc.constraint_name
+      WHERE constraint_type = 'FOREIGN KEY'
+    `;
 
-    while (this.chatHistory.length > this.MAX_HISTORY_LENGTH) {
-      this.chatHistory.splice(0, 2);
+    try {
+      const result = await this.executeQuery(sql);
+      const relationships = JSON.parse(result);
+
+      // Create initial metadata for foreign keys
+      relationships.forEach((rel: any) => {
+        const tableMetadata =
+          this.columnMetadata.get(rel.table_name) || new Map();
+
+        tableMetadata.set(rel.column_name, {
+          description: `Foreign key referencing ${rel.foreign_table_name}.${rel.foreign_column_name}`,
+          examples: [],
+          foreignKey: {
+            table: rel.foreign_table_name,
+            column: rel.foreign_column_name,
+          },
+        });
+
+        this.columnMetadata.set(rel.table_name, tableMetadata);
+      });
+    } catch (error) {
+      console.error("Error detecting table relationships:", error);
     }
+  }
+
+  private buildSystemPrompt(includeErrorContext: string = ""): string {
+    let prompt =
+      "You are a data analyst assistant. You have access to a PostgreSQL database with these tables:\n\n";
+
+    // Add detailed schema information
+    for (const [tableName, schema] of this.schemaCache.entries()) {
+      prompt += `Table: ${tableName}\n`;
+      prompt += "Columns:\n";
+
+      for (const column of schema) {
+        const metadata = this.columnMetadata
+          .get(tableName)
+          ?.get(column.column_name);
+        prompt += `- ${column.column_name} (${column.data_type})`;
+
+        if (metadata) {
+          prompt += `: ${metadata.description}`;
+          if (metadata.foreignKey) {
+            prompt += ` [References ${metadata.foreignKey.table}.${metadata.foreignKey.column}]`;
+          }
+        }
+        prompt += "\n";
+      }
+      prompt += "\n";
+    }
+
+    // Add query guidelines
+    prompt += "\nQuery Guidelines:\n";
+    prompt += OllamaMCPHost.QUERY_GUIDELINES;
+
+    if (includeErrorContext) {
+      prompt += `\nPrevious Error Context: ${includeErrorContext}\n`;
+      prompt +=
+        "Please revise your approach and try a different query strategy.\n";
+    }
+
+    return prompt;
   }
 
   async connect() {
     await this.client.connect(this.transport);
 
+    // First detect relationships
+    await this.detectTableRelationships();
+
+    // Then load schemas
     const resources = await this.client.request(
       { method: "resources/list" },
       ListResourcesResultSchema
@@ -94,40 +193,9 @@ class OllamaMCPHost {
               error instanceof Error ? error.message : String(error)
             );
           }
-        } else {
-          console.warn(`No text content found for resource ${resource.uri}`);
         }
       }
     }
-  }
-
-  private buildSystemPrompt(includeErrorContext: string = ""): string {
-    let prompt =
-      "You are a data analyst assistant. You have access to a PostgreSQL database with the following tables and schemas:\n\n";
-
-    for (const [tableName, schema] of this.schemaCache.entries()) {
-      prompt += `Table: ${tableName}\nColumns:\n`;
-      for (const column of schema) {
-        prompt += `- ${column.column_name} (${column.data_type})\n`;
-      }
-      prompt += "\n";
-    }
-
-    prompt += "\nWhen answering questions about the data:\n";
-    prompt += "1. First write a SQL query to get the necessary information\n";
-    prompt += "2. Use the 'query' tool to execute the SQL query\n";
-    prompt +=
-      "3. Analyze the results and provide a natural language response\n";
-    prompt +=
-      "\nImportant: Only use SELECT statements - no modifications allowed.\n";
-
-    if (includeErrorContext) {
-      prompt += `\nThe previous query attempt failed with the following error: ${includeErrorContext}\n`;
-      prompt +=
-        "Please revise your approach and try a different query strategy.\n";
-    }
-
-    return prompt;
   }
 
   private async executeQuery(sql: string): Promise<string> {
@@ -148,47 +216,10 @@ class OllamaMCPHost {
     return response.content[0].text as string;
   }
 
-  private async attemptQuery(
-    messages: { role: string; content: string }[]
-  ): Promise<{
-    success: boolean;
-    response: string;
-    sql?: string;
-    queryResult?: string;
-    error?: string;
-  }> {
-    const response = await ollama.chat({
-      model: this.modelName,
-      messages: messages,
-    });
-
-    const sqlMatch = response.message.content.match(/```sql\n([\s\S]*?)\n```/);
-    if (!sqlMatch) {
-      return {
-        success: false,
-        response: response.message.content,
-        error: "No SQL query found in response",
-      };
-    }
-
-    const sql = sqlMatch[1].trim();
-    console.log("Executing SQL:", sql);
-
-    try {
-      const queryResult = await this.executeQuery(sql);
-      return {
-        success: true,
-        response: response.message.content,
-        sql,
-        queryResult,
-      };
-    } catch (error) {
-      return {
-        success: false,
-        response: response.message.content,
-        sql,
-        error: error instanceof Error ? error.message : String(error),
-      };
+  private addToHistory(role: string, content: string) {
+    this.chatHistory.push({ role, content });
+    while (this.chatHistory.length > this.MAX_HISTORY_LENGTH) {
+      this.chatHistory.shift();
     }
   }
 
@@ -198,7 +229,6 @@ class OllamaMCPHost {
       let lastError: string | undefined;
 
       while (attemptCount <= this.MAX_RETRIES) {
-        // Prepare messages for this attempt
         const messages = [
           { role: "system", content: this.buildSystemPrompt(lastError) },
           ...this.chatHistory,
@@ -213,30 +243,47 @@ class OllamaMCPHost {
           attemptCount > 0 ? `\nRetry attempt ${attemptCount}...` : ""
         );
 
-        const result = await this.attemptQuery(messages);
+        // Get response from Ollama
+        const response = await ollama.chat({
+          model: this.modelName,
+          messages: messages,
+        });
 
-        if (result.success && result.queryResult) {
-          // Query succeeded
-          this.addToHistory("assistant", result.response);
+        // Extract SQL query
+        const sqlMatch = response.message.content.match(
+          /```sql\n([\s\S]*?)\n```/
+        );
+        if (!sqlMatch) {
+          return response.message.content;
+        }
 
-          // Request interpretation of results
-          const resultPrompt = `Here are the results of the SQL query: ${result.queryResult}\n\nPlease analyze these results and provide a clear summary.`;
-          this.addToHistory("user", resultPrompt);
+        const sql = sqlMatch[1].trim();
+        console.log("Executing SQL:", sql);
+
+        try {
+          // Execute the query
+          const queryResult = await this.executeQuery(sql);
+          this.addToHistory("assistant", response.message.content);
+
+          // Ask for result interpretation
+          const interpretationMessages = [
+            ...messages,
+            { role: "assistant", content: response.message.content },
+            {
+              role: "user",
+              content: `Here are the results of the SQL query: ${queryResult}\n\nPlease analyze these results and provide a clear summary.`,
+            },
+          ];
 
           const finalResponse = await ollama.chat({
             model: this.modelName,
-            messages: [
-              ...messages,
-              { role: "assistant", content: result.response },
-              { role: "user", content: resultPrompt },
-            ],
+            messages: interpretationMessages,
           });
 
           this.addToHistory("assistant", finalResponse.message.content);
           return finalResponse.message.content;
-        } else {
-          // Query failed
-          lastError = result.error;
+        } catch (error) {
+          lastError = error instanceof Error ? error.message : String(error);
           if (attemptCount === this.MAX_RETRIES) {
             return `I apologize, but I was unable to successfully query the database after ${
               this.MAX_RETRIES + 1
