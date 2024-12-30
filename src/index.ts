@@ -32,7 +32,8 @@ class OllamaMCPHost {
   private modelName: string;
   private schemaCache: Map<string, DatabaseSchema[]> = new Map();
   private chatHistory: { role: string; content: string }[] = [];
-  private readonly MAX_HISTORY_LENGTH = 20; // Maximum number of messages to keep in history
+  private readonly MAX_HISTORY_LENGTH = 20;
+  private readonly MAX_RETRIES = 2; // Maximum number of retry attempts
 
   constructor(modelName?: string) {
     this.modelName =
@@ -57,8 +58,6 @@ class OllamaMCPHost {
   private addToHistory(role: string, content: string) {
     this.chatHistory.push({ role, content });
 
-    // If we exceed max length, remove oldest pairs of messages
-    // We remove in pairs to maintain context between user questions and assistant answers
     while (this.chatHistory.length > this.MAX_HISTORY_LENGTH) {
       this.chatHistory.splice(0, 2);
     }
@@ -102,7 +101,7 @@ class OllamaMCPHost {
     }
   }
 
-  private buildSystemPrompt(): string {
+  private buildSystemPrompt(includeErrorContext: string = ""): string {
     let prompt =
       "You are a data analyst assistant. You have access to a PostgreSQL database with the following tables and schemas:\n\n";
 
@@ -121,6 +120,12 @@ class OllamaMCPHost {
       "3. Analyze the results and provide a natural language response\n";
     prompt +=
       "\nImportant: Only use SELECT statements - no modifications allowed.\n";
+
+    if (includeErrorContext) {
+      prompt += `\nThe previous query attempt failed with the following error: ${includeErrorContext}\n`;
+      prompt +=
+        "Please revise your approach and try a different query strategy.\n";
+    }
 
     return prompt;
   }
@@ -143,53 +148,106 @@ class OllamaMCPHost {
     return response.content[0].text as string;
   }
 
+  private async attemptQuery(
+    messages: { role: string; content: string }[]
+  ): Promise<{
+    success: boolean;
+    response: string;
+    sql?: string;
+    queryResult?: string;
+    error?: string;
+  }> {
+    const response = await ollama.chat({
+      model: this.modelName,
+      messages: messages,
+    });
+
+    const sqlMatch = response.message.content.match(/```sql\n([\s\S]*?)\n```/);
+    if (!sqlMatch) {
+      return {
+        success: false,
+        response: response.message.content,
+        error: "No SQL query found in response",
+      };
+    }
+
+    const sql = sqlMatch[1].trim();
+    console.log("Executing SQL:", sql);
+
+    try {
+      const queryResult = await this.executeQuery(sql);
+      return {
+        success: true,
+        response: response.message.content,
+        sql,
+        queryResult,
+      };
+    } catch (error) {
+      return {
+        success: false,
+        response: response.message.content,
+        sql,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
   async processQuestion(question: string): Promise<string> {
     try {
-      // Start with system prompt and chat history
-      const messages = [
-        { role: "system", content: this.buildSystemPrompt() },
-        ...this.chatHistory,
-        { role: "user", content: question },
-      ];
+      let attemptCount = 0;
+      let lastError: string | undefined;
 
-      // Add the user's question to history
-      this.addToHistory("user", question);
+      while (attemptCount <= this.MAX_RETRIES) {
+        // Prepare messages for this attempt
+        const messages = [
+          { role: "system", content: this.buildSystemPrompt(lastError) },
+          ...this.chatHistory,
+          { role: "user", content: question },
+        ];
 
-      let response = await ollama.chat({
-        model: this.modelName,
-        messages: messages,
-      });
+        if (attemptCount === 0) {
+          this.addToHistory("user", question);
+        }
 
-      const sqlMatch = response.message.content.match(
-        /```sql\n([\s\S]*?)\n```/
-      );
-      if (sqlMatch) {
-        const sql = sqlMatch[1].trim();
-        console.log("Executing SQL:", sql);
+        console.log(
+          attemptCount > 0 ? `\nRetry attempt ${attemptCount}...` : ""
+        );
 
-        const queryResult = await this.executeQuery(sql);
+        const result = await this.attemptQuery(messages);
 
-        // Add the assistant's response with SQL to history
-        this.addToHistory("assistant", response.message.content);
+        if (result.success && result.queryResult) {
+          // Query succeeded
+          this.addToHistory("assistant", result.response);
 
-        // Add the query results and request for interpretation
-        const resultPrompt = `Here are the results of the SQL query: ${queryResult}\n\nPlease analyze these results and provide a clear summary.`;
-        this.addToHistory("user", resultPrompt);
+          // Request interpretation of results
+          const resultPrompt = `Here are the results of the SQL query: ${result.queryResult}\n\nPlease analyze these results and provide a clear summary.`;
+          this.addToHistory("user", resultPrompt);
 
-        response = await ollama.chat({
-          model: this.modelName,
-          messages: [
-            ...messages,
-            { role: "assistant", content: response.message.content },
-            { role: "user", content: resultPrompt },
-          ],
-        });
+          const finalResponse = await ollama.chat({
+            model: this.modelName,
+            messages: [
+              ...messages,
+              { role: "assistant", content: result.response },
+              { role: "user", content: resultPrompt },
+            ],
+          });
+
+          this.addToHistory("assistant", finalResponse.message.content);
+          return finalResponse.message.content;
+        } else {
+          // Query failed
+          lastError = result.error;
+          if (attemptCount === this.MAX_RETRIES) {
+            return `I apologize, but I was unable to successfully query the database after ${
+              this.MAX_RETRIES + 1
+            } attempts. The last error was: ${lastError}`;
+          }
+        }
+
+        attemptCount++;
       }
 
-      // Add final response to history
-      this.addToHistory("assistant", response.message.content);
-
-      return response.message.content;
+      return "An unexpected error occurred while processing your question.";
     } catch (error) {
       console.error("Error processing question:", error);
       return `An error occurred: ${
