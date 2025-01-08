@@ -1,11 +1,7 @@
 import ollama from "ollama";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import {
-  ReadResourceResultSchema,
-  ListResourcesResultSchema,
-  CallToolResultSchema,
-} from "@modelcontextprotocol/sdk/types.js";
+import { CallToolResultSchema } from "@modelcontextprotocol/sdk/types.js";
 import dotenv from "dotenv";
 import { fileURLToPath } from "url";
 
@@ -21,49 +17,129 @@ if (!databaseUrl) {
   process.exit(1);
 }
 
-interface DatabaseSchema {
-  column_name: string;
-  data_type: string;
-}
+const SYSTEM_PROMPT = `
+You have access to a PostgreSQL database.
+Use your knowledge of SQL to answer the user's question by writing queries on their behalf.
+You may only respond with a single query at a time.
 
-interface ColumnMetadata {
-  description: string;
-  examples: string[];
-  foreignKey?: {
-    table: string;
-    column: string;
-  };
-}
+Your response must be in this format:
+
+\`\`\`sql
+Your query goes here.
+\`\`\`
+
+If the user tells you that there was an MCP error, analyze the error and respond with a different query.
+
+When you think you have the final answer to the user's question, prefix your response with "Final Answer:\n"
+`;
+
+const USER_PROMPT = `
+I have a database with the following tables:
+
+[
+  {"table_name": "action_item_status_history"},
+  {"table_name": "application_key"},
+  {"table_name": "board"},
+  {"table_name": "alembic_version"},
+  {"table_name": "archival_measurement"},
+  {"table_name": "application_audit"},
+  {"table_name": "combined_load"},
+  {"table_name": "customer_operating_preferences_staging"},
+  {"table_name": "application"},
+  {"table_name": "bank_account"},
+  {"table_name": "baseline_value"},
+  {"table_name": "control_profile"},
+  {"table_name": "archival_facility_measurement"},
+  {"table_name": "account_manager"},
+  {"table_name": "action_item"},
+  {"table_name": "board_access_control"},
+  {"table_name": "email_facility"},
+  {"table_name": "email"},
+  {"table_name": "device"},
+  {"table_name": "dwolla_customer"},
+  {"table_name": "facility_contact_association"},
+  {"table_name": "facility_operating_preferences"},
+  {"table_name": "facility_operating_preferences_account_default"},
+  {"table_name": "facility_operating_preferences_account_default_staging"},
+  {"table_name": "facility"},
+  {"table_name": "facility_enablement"},
+  {"table_name": "facility_operating_preferences_staging"},
+  {"table_name": "program"},
+  {"table_name": "hubspot_email_user"},
+  {"table_name": "meter"},
+  {"table_name": "firmware_update"},
+  {"table_name": "foobar"},
+  {"table_name": "identity_role"},
+  {"table_name": "facility_transfers"},
+  {"table_name": "organization"},
+  {"table_name": "feature_access"},
+  {"table_name": "generator"},
+  {"table_name": "hubspot_email"},
+  {"table_name": "program_facility_association"},
+  {"table_name": "historical_program_facility_association"},
+  {"table_name": "interval_staging"},
+  {"table_name": "line_item_event_association"},
+  {"table_name": "line_item"},
+  {"table_name": "market_timezone_override"},
+  {"table_name": "meter_configuration"},
+  {"table_name": "miso_lmr_price_offer_selection"},
+  {"table_name": "portfolio"},
+  {"table_name": "opportunity"},
+  {"table_name": "portfolio_facilities"},
+  {"table_name": "portfolio_type"},
+  {"table_name": "program_geography_association_temp"},
+  {"table_name": "program_tmp_migration"},
+  {"table_name": "request_job"},
+  {"table_name": "meter_provider_configuration"},
+  {"table_name": "meter_provider"},
+  {"table_name": "payment_program_association"},
+  {"table_name": "portfolio_applications"},
+  {"table_name": "portfolio_metadata"},
+  {"table_name": "program_zipcode_association"},
+  {"table_name": "registration_dispatch_performance"},
+  {"table_name": "registration_potential_value"},
+  {"table_name": "permission"},
+  {"table_name": "role_permissions"},
+  {"table_name": "portfolio_users"},
+  {"table_name": "settlement_payment"},
+  {"table_name": "ses_email_user"},
+  {"table_name": "settlement_payment_transition_reason"},
+  {"table_name": "ses_email"},
+  {"table_name": "user_alert_configuration"},
+  {"table_name": "user_alert_notification"},
+  {"table_name": "temp_portfolio"},
+  {"table_name": "scheduled_event"},
+  {"table_name": "settlement_baseline_value"},
+  {"table_name": "user_audit_impl"},
+  {"table_name": "user"},
+  {"table_name": "settlement_facility_load"},
+  {"table_name": "user_activation_audit"},
+  {"table_name": "user_query"},
+  {"table_name": "voltus_opportunity_product"},
+  {"table_name": "vcrm_group_registration"},
+  {"table_name": "vendor_payment"},
+  {"table_name": "voltlet_configuration"},
+  {"table_name": "event_facility_association"},
+  {"table_name": "event_acknowledgment"},
+  {"table_name": "action_item_attempt"},
+  {"table_name": "utility_account"},
+  {"table_name": "role"},
+  {"table_name": "line_item_transition_log"},
+  {"table_name": "openadr_settings"},
+  {"table_name": "settlement_payment_transition_log"}
+]
+
+I have a question:
+
+`;
 
 class OllamaMCPHost {
   private client: Client;
   private transport: StdioClientTransport;
   private modelName: string;
-  private schemaCache: Map<string, DatabaseSchema[]> = new Map();
-  private columnMetadata: Map<string, Map<string, ColumnMetadata>> = new Map();
   private chatHistory: { role: string; content: string }[] = [];
   private readonly MAX_HISTORY_LENGTH = 20;
   private readonly MAX_RETRIES = 5;
-
-  private static readonly QUERY_GUIDELINES = `
-When analyzing questions:
-1. First write a SQL query to get the necessary information. Identify which tables contain the relevant information by looking at:
-   - Table names and their purposes
-   - Column names and descriptions
-   - Foreign key relationships
-2. Use the 'query' tool to execute the SQL query
-3. If unsure about table contents, write a sample query first:
-   SELECT column_name, COUNT(*) FROM table_name GROUP BY column_name LIMIT 5;
-4. For complex questions, break down into multiple queries:
-   - First query to validate data availability
-   - Second query to get detailed information
-5. Always include appropriate JOIN conditions when combining tables
-6. Use WHERE clauses to filter irrelevant data
-7. Consider using ORDER BY for sorted results
-
-Important: Only use SELECT statements - no modifications allowed!
-
-When you are finished, analyze the results and provide a natural language response.`;
 
   constructor(modelName?: string) {
     this.modelName =
@@ -78,124 +154,8 @@ When you are finished, analyze the results and provide a natural language respon
     );
   }
 
-  private async detectTableRelationships(): Promise<void> {
-    // Query the database to find foreign key relationships
-    const sql = `
-      SELECT
-        tc.table_name as table_name,
-        kcu.column_name as column_name,
-        ccu.table_name AS foreign_table_name,
-        ccu.column_name AS foreign_column_name
-      FROM information_schema.table_constraints tc
-      JOIN information_schema.key_column_usage kcu
-        ON tc.constraint_name = kcu.constraint_name
-      JOIN information_schema.constraint_column_usage ccu
-        ON ccu.constraint_name = tc.constraint_name
-      WHERE constraint_type = 'FOREIGN KEY'
-    `;
-
-    try {
-      const result = await this.executeQuery(sql);
-      const relationships = JSON.parse(result);
-
-      // Create initial metadata for foreign keys
-      relationships.forEach((rel: any) => {
-        const tableMetadata =
-          this.columnMetadata.get(rel.table_name) || new Map();
-
-        tableMetadata.set(rel.column_name, {
-          description: `Foreign key referencing ${rel.foreign_table_name}.${rel.foreign_column_name}`,
-          examples: [],
-          foreignKey: {
-            table: rel.foreign_table_name,
-            column: rel.foreign_column_name,
-          },
-        });
-
-        this.columnMetadata.set(rel.table_name, tableMetadata);
-      });
-    } catch (error) {
-      console.error("Error detecting table relationships:", error);
-    }
-  }
-
-  private buildSystemPrompt(includeErrorContext: string = ""): string {
-    let prompt =
-      "You are a data analyst assistant. You have access to a PostgreSQL database with these tables:\n\n";
-
-    // Add detailed schema information
-    for (const [tableName, schema] of this.schemaCache.entries()) {
-      prompt += `Table: ${tableName}\n`;
-      prompt += "Columns:\n";
-
-      for (const column of schema) {
-        const metadata = this.columnMetadata
-          .get(tableName)
-          ?.get(column.column_name);
-        prompt += `- ${column.column_name} (${column.data_type})`;
-
-        if (metadata) {
-          prompt += `: ${metadata.description}`;
-          if (metadata.foreignKey) {
-            prompt += ` [References ${metadata.foreignKey.table}.${metadata.foreignKey.column}]`;
-          }
-        }
-        prompt += "\n";
-      }
-      prompt += "\n";
-    }
-
-    // Add query guidelines
-    prompt += "\nQuery Guidelines:\n";
-    prompt += OllamaMCPHost.QUERY_GUIDELINES;
-
-    if (includeErrorContext) {
-      prompt += `\nPrevious Error Context: ${includeErrorContext}\n`;
-      prompt +=
-        "Please revise your approach and try a different query strategy.\n";
-    }
-
-    return prompt;
-  }
-
   async connect() {
     await this.client.connect(this.transport);
-
-    // First detect relationships
-    await this.detectTableRelationships();
-
-    // Then load schemas
-    const resources = await this.client.request(
-      { method: "resources/list" },
-      ListResourcesResultSchema
-    );
-
-    for (const resource of resources.resources) {
-      if (resource.uri.endsWith("/schema")) {
-        const schema = await this.client.request(
-          {
-            method: "resources/read",
-            params: { uri: resource.uri },
-          },
-          ReadResourceResultSchema
-        );
-
-        if (schema.contents[0]?.text) {
-          try {
-            const tableName = resource.uri.split("/").slice(-2)[0];
-            this.schemaCache.set(
-              tableName,
-              JSON.parse(schema.contents[0].text as string)
-            );
-          } catch (error) {
-            console.error(
-              `Failed to parse schema for resource ${resource.uri}:`,
-              error instanceof Error ? error.message : String(error)
-            );
-          }
-        }
-      }
-    }
   }
 
   private async executeQuery(sql: string): Promise<string> {
@@ -226,18 +186,16 @@ When you are finished, analyze the results and provide a natural language respon
   async processQuestion(question: string): Promise<string> {
     try {
       let attemptCount = 0;
-      let lastError: string | undefined;
 
       while (attemptCount <= this.MAX_RETRIES) {
         const messages = [
-          { role: "system", content: this.buildSystemPrompt(lastError) },
+          { role: "system", content: SYSTEM_PROMPT },
+          {
+            role: "user",
+            content: `${USER_PROMPT}${question}`,
+          },
           ...this.chatHistory,
-          { role: "user", content: question },
         ];
-
-        if (attemptCount === 0) {
-          this.addToHistory("user", question);
-        }
 
         console.log(
           attemptCount > 0 ? `\nRetry attempt ${attemptCount}...` : ""
@@ -248,6 +206,7 @@ When you are finished, analyze the results and provide a natural language respon
           model: this.modelName,
           messages: messages,
         });
+        this.addToHistory("assistant", response.message.content);
 
         // Extract SQL query
         const sqlMatch = response.message.content.match(
@@ -258,36 +217,22 @@ When you are finished, analyze the results and provide a natural language respon
         }
 
         const sql = sqlMatch[1].trim();
-        console.log("Executing SQL:", sql);
 
         try {
           // Execute the query
           const queryResult = await this.executeQuery(sql);
-          this.addToHistory("assistant", response.message.content);
-
-          // Ask for result interpretation
-          const interpretationMessages = [
-            ...messages,
-            { role: "assistant", content: response.message.content },
-            {
-              role: "user",
-              content: `Here are the results of the SQL query: ${queryResult}\n\nPlease analyze these results and provide a clear summary.`,
-            },
-          ];
-
-          const finalResponse = await ollama.chat({
-            model: this.modelName,
-            messages: interpretationMessages,
-          });
-
-          this.addToHistory("assistant", finalResponse.message.content);
-          return finalResponse.message.content;
+          this.addToHistory(
+            "user",
+            `Here are the results of the SQL query: ${queryResult}`
+          );
         } catch (error) {
-          lastError = error instanceof Error ? error.message : String(error);
+          const errorMessage =
+            error instanceof Error ? error.message : String(error);
+          this.addToHistory("user", errorMessage);
           if (attemptCount === this.MAX_RETRIES) {
             return `I apologize, but I was unable to successfully query the database after ${
               this.MAX_RETRIES + 1
-            } attempts. The last error was: ${lastError}`;
+            } attempts. The last error was: ${errorMessage}`;
           }
         }
 
@@ -320,7 +265,7 @@ async function main() {
     console.log(
       "\nConnected to database. You can now ask questions about your data."
     );
-    console.log('Type "exit" to quit.\n');
+    console.log('Type "/exit" to quit.\n');
 
     const askQuestion = (prompt: string) =>
       new Promise<string>((resolve) => {
@@ -332,7 +277,7 @@ async function main() {
         "\nWhat would you like to know about your data? "
       );
 
-      if (userInput.toLowerCase() === "exit") {
+      if (userInput.toLowerCase().includes("/exit")) {
         console.log("\nGoodbye!\n");
         readline.close();
         await host.cleanup();
