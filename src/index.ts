@@ -1,9 +1,11 @@
-import ollama from "ollama";
+import ollama, { Message } from "ollama";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { CallToolResultSchema } from "@modelcontextprotocol/sdk/types.js";
 import dotenv from "dotenv";
 import { fileURLToPath } from "url";
+import { z } from "zod";
+import { zodToJsonSchema } from "zod-to-json-schema";
 
 // Load environment variables from .env file
 dotenv.config();
@@ -19,18 +21,17 @@ if (!databaseUrl) {
 
 const SYSTEM_PROMPT = `
 You have access to a PostgreSQL database.
-Use your knowledge of SQL to answer the user's question by writing queries on their behalf.
-You may only respond with a single query at a time.
+Use your knowledge of SQL to present an SQL query that will answer the user's question.
+The user will execute the query and share the results with you.
+Use the query results to verify that the query is correct.
+If there are no query results, your answer is not verfied.
+If the query results actually answer the question, mark the answer verified,
+and provide a good human-readable answer.
 
-Your response must be in this format:
-
-\`\`\`sql
-Your query goes here.
-\`\`\`
+You can use the results to refine your query, if your previous answer was insufficient.
+Always include the SQL query in your response.
 
 If the user tells you that there was an MCP error, analyze the error and respond with a different query.
-
-When you think you have the final answer to the user's question, prefix your response with "Final Answer:\n"
 `;
 
 const USER_PROMPT = `
@@ -133,6 +134,42 @@ I have a question:
 
 `;
 
+interface SqlModelResponse {
+  sqlQuery: string;
+  isVerified: boolean;
+  answerSummary: string;
+  getFormattedAnswer(): string;
+}
+
+class JsonSqlModelResponse implements SqlModelResponse {
+  sqlQuery: string;
+  isVerified: boolean;
+  answerSummary: string;
+
+  constructor(sqlQuery: string, isVerified: boolean, answerSummary: string) {
+    this.sqlQuery = sqlQuery;
+    this.isVerified = isVerified;
+    this.answerSummary = answerSummary;
+  }
+
+  getFormattedAnswer(): string {
+    let formattedAnswer = `${this.answerSummary}.
+
+    This was obtained using the following query:
+
+    \`\`\`sql
+    ${this.sqlQuery}
+    \`\`\`
+    `;
+
+    if (this.isVerified) {
+      return formattedAnswer;
+    } else {
+      return `${formattedAnswer} (Answer is not verified.)`;
+    }
+  }
+}
+
 class OllamaMCPHost {
   private client: Client;
   private transport: StdioClientTransport;
@@ -183,7 +220,37 @@ class OllamaMCPHost {
     }
   }
 
+  private async queryModelJson(messages: Message[]): Promise<SqlModelResponse> {
+    const loc = "queryModelJson(): ";
+
+    const SqlJsonContent = z.object({
+      sqlQuery: z.string(),
+      isVerified: z.boolean(),
+      answerSummary: z.string(),
+    })
+
+    // Get response from Ollama
+    const response = await ollama.chat({
+      model: this.modelName,
+      messages: messages,
+      format: zodToJsonSchema(SqlJsonContent)
+    });
+
+    const content = response.message.content;
+    this.addToHistory("assistant", content);
+    // console.log(loc + `response: ${content}`);
+
+    try {
+      const parsedData = SqlJsonContent.parse(JSON.parse(content));
+      return new JsonSqlModelResponse(parsedData.sqlQuery, parsedData.isVerified, parsedData.answerSummary);
+    } catch (error) {
+      throw new Error(`Could not extract SQL from this response: ${response.message.content} because of error: ${error}`);
+    }
+  }
+
   async processQuestion(question: string): Promise<string> {
+    const loc = "processQuestion(): ";
+
     try {
       let attemptCount = 0;
 
@@ -201,26 +268,32 @@ class OllamaMCPHost {
           attemptCount > 0 ? `\nRetry attempt ${attemptCount}...` : ""
         );
 
-        // Get response from Ollama
-        const response = await ollama.chat({
-          model: this.modelName,
-          messages: messages,
-        });
-        this.addToHistory("assistant", response.message.content);
+        let sqlModelResponse = null;
 
-        // Extract SQL query
-        const sqlMatch = response.message.content.match(
-          /```sql\n([\s\S]*?)\n```/
-        );
-        if (!sqlMatch) {
-          return response.message.content;
+        try {
+          sqlModelResponse = await this.queryModelJson(messages);
+        } catch (error) {
+          const errorMessage =
+            error instanceof Error ? error.message : String(error);
+          this.addToHistory("user", errorMessage);
+          return errorMessage;
         }
 
-        const sql = sqlMatch[1].trim();
+        if (!sqlModelResponse) {
+          console.log(loc + `Skipping invalid sqlModelResponse: ${sqlModelResponse}`);
+          continue;
+        }
+
+        if (sqlModelResponse.isVerified) {
+          return sqlModelResponse.getFormattedAnswer();
+        }
 
         try {
           // Execute the query
-          const queryResult = await this.executeQuery(sql);
+          const queryResult = await this.executeQuery(sqlModelResponse.sqlQuery);
+
+          console.log(loc + "Result from executing query: " + queryResult);
+
           this.addToHistory(
             "user",
             `Here are the results of the SQL query: ${queryResult}`
